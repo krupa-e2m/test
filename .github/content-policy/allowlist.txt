@@ -1,0 +1,10 @@
+# Content policy allowlist: one Python regex per line, matched against
+# "location:line:snippet" (e.g. "src/app.min.js:12:...").
+#
+# Only for genuine false positives, such as a chance match inside a generated
+# file. Never add a real mention of the term. Changes here should be reviewed
+# like code: the PR scan reads this file from the base branch, so an entry
+# only takes effect once it has been merged.
+#
+# Example:
+# ^engine/dev-libs/.*\.min\.js:
