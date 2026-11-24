@@ -1,0 +1,126 @@
+name: Slack PR merge notifications
+
+# Notify only when a PR is MERGED into dev-connect-wp or dev-command.
+# Individual commits/pushes, other branches, and PRs closed without merging are ignored.
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - dev-connect-wp
+      - dev-command
+
+jobs:
+  notify:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Send Slack notification
+        uses: actions/github-script@v7
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        with:
+          script: |
+            const webhook = process.env.SLACK_WEBHOOK_URL;
+            if (!webhook) {
+              core.setFailed('SLACK_WEBHOOK_URL repository secret is not set.');
+              return;
+            }
+
+            const pr = context.payload.pull_request;
+            const { owner, repo } = context.repo;
+            const base = pr.base.ref;
+            const repoUrl = context.payload.repository.html_url;
+            const product = { 'dev-connect-wp': 'WordPress plugin', 'dev-command': 'Claude plugin' }[base] || base;
+
+            // Slack mrkdwn needs &, <, > escaped.
+            const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            const firstLine = (s) => String(s || '').split('\n')[0];
+            const clip = (s, n) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
+            const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+
+            let commits = [];
+            try {
+              commits = await github.paginate(github.rest.pulls.listCommits, { owner, repo, pull_number: pr.number, per_page: 100 });
+            } catch (e) {
+              core.warning(`Commit lookup failed: ${e.message}`);
+            }
+
+            // Reviewers whose latest decision on the PR is "approved".
+            let approvers = [];
+            try {
+              const reviews = await github.paginate(github.rest.pulls.listReviews, { owner, repo, pull_number: pr.number, per_page: 100 });
+              const latest = {};
+              for (const r of reviews) if (r.user && r.state !== 'COMMENTED') latest[r.user.login] = r.state;
+              approvers = Object.keys(latest).filter((u) => latest[u] === 'APPROVED');
+            } catch (e) {
+              core.warning(`Review lookup failed: ${e.message}`);
+            }
+
+            const mergeSha = pr.merge_commit_sha;
+            const mergeUrl = `${repoUrl}/commit/${mergeSha}`;
+            const last = commits[commits.length - 1];
+
+            const heading = `✅ [${product}] PR #${pr.number} merged into ${base}: ${pr.title}`;
+            const description = pr.body ? clip(esc(pr.body.trim()), 500) : '_No description provided._';
+            const stats = `${plural(pr.commits, 'commit')} · ${plural(pr.changed_files, 'file')} changed · +${pr.additions} / −${pr.deletions}`;
+
+            const blocks = [
+              { type: 'header', text: { type: 'plain_text', text: clip(heading, 150), emoji: true } },
+              {
+                type: 'section',
+                text: { type: 'mrkdwn', text: `*Summary*\n${description}\n\n${stats}` },
+              },
+              {
+                type: 'section',
+                fields: [
+                  { type: 'mrkdwn', text: `*PR author*\n${esc(pr.user.login)}` },
+                  { type: 'mrkdwn', text: `*Approved by*\n${approvers.length ? esc(approvers.join(', ')) : '_No GitHub approval_'}` },
+                  { type: 'mrkdwn', text: `*Merged by*\n${esc(pr.merged_by ? pr.merged_by.login : 'unknown')}` },
+                  { type: 'mrkdwn', text: `*Branch*\n\`${esc(pr.head.ref)}\` → \`${esc(base)}\`` },
+                  { type: 'mrkdwn', text: `*Merge commit*\n<${mergeUrl}|${mergeSha.slice(0, 7)}>` },
+                ],
+              },
+            ];
+
+            if (last) {
+              blocks.push({
+                type: 'section',
+                text: {
+                  type: 'mrkdwn',
+                  text: `*Latest commit* by ${esc(last.commit.author.name)}\n>${clip(esc(last.commit.message), 1000).replace(/\n/g, '\n>')}`,
+                },
+              });
+            }
+
+            // List up to 10 commits in the PR, newest first.
+            if (commits.length > 1) {
+              const lines = commits.slice(-10).reverse().map(
+                (c) => `• <${c.html_url}|\`${c.sha.slice(0, 7)}\`> ${esc(clip(firstLine(c.commit.message), 80))} — ${esc(c.commit.author.name)}`
+              );
+              if (commits.length > 10) lines.push(`_…and ${commits.length - 10} more_`);
+              blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*Commits in this PR*\n${lines.join('\n')}` } });
+            }
+
+            blocks.push({
+              type: 'actions',
+              elements: [
+                { type: 'button', text: { type: 'plain_text', text: 'View PR' }, url: pr.html_url, style: 'primary' },
+                { type: 'button', text: { type: 'plain_text', text: 'View merge commit' }, url: mergeUrl },
+              ],
+            });
+            blocks.push({
+              type: 'context',
+              elements: [{ type: 'mrkdwn', text: `<${repoUrl}|${owner}/${repo}>` }],
+            });
+
+            const res = await fetch(webhook, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ text: heading, blocks }),
+            });
+            const body = await res.text();
+            if (!res.ok || body !== 'ok') core.setFailed(`Slack returned ${res.status}: ${body}`);
+            else core.info('Slack notification sent.');
